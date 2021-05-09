@@ -87,8 +87,16 @@ for chunk in network_recieve(): # replace with however you're recieving the chun
 At a higher level, we can use the protocol to synchronize folders on the remote (sender) and local (receiver) targets.
 
 ## Sender-side
-1. Every N seconds, perform a user-defined glob relative to `sync_folder` and get a list of `new_files`
+1. Every N seconds, perform a glob relative to `sync_folder` and get a list of `new_files`
 	- In the provided implementation, this is done using the default Rsync algorithm
+	- In the provided implementation, create a file named `.diodeinclude` at the root of the directory with a list of rules for files you would like sync'd.
+```
+# .diodeinclude
+*.txt
+```
+will send only text files. The file format is the same as `.gitignore`, except this is an inclusionary, not exclusionary, file.
+If this file does not exist, all files will be sent will be sent.
+
 2. Tar `new_files` into a single file, and chunkify it
 3. Send the chunks over the network
 

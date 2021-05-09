@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "diode-ftp"
+version = "0.1.0"
+description = ""
+authors = ["saltyJeff <saltyJeff@users.noreply.github.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+
+[tool.poetry.dev-dependencies]
+pytest = "^5.2"
+
+[tool.poetry.scripts]
+sync-sender = "diode_ftp.cli:start_folder_sender"
+sync-receiver = "diode_ftp.cli:start_folder_receiver"
+
+[build-system]
+requires = ["poetry>=0.12"]
+build-backend = "poetry.masonry.api"

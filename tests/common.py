@@ -29,5 +29,6 @@ def get_available_port():
 	return port
 
 BIG_FILE = PARENT / '.tmp_big.bin'
-create_big_file(BIG_FILE, 10)
+if not BIG_FILE.exists():
+	create_big_file(BIG_FILE, 10)
 BIG_HASH = hash_file(BIG_FILE)

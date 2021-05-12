@@ -1,6 +1,6 @@
 from os import PathLike
 import os
-from typing import Callable, Iterable, NamedTuple, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, NamedTuple, List, Optional, Set, Tuple, Union
 from pathlib import Path
 import socket
 from glob import iglob
@@ -14,6 +14,7 @@ from gitignore_parser.gitignore_parser import parse_gitignore
 from si_prefix import si_format
 
 FileMetadata = NamedTuple('FileMetadata', [('path', Path), ('size', int), ('mtime', float)])
+default_sender_log = getLogger('folder_sender')
 
 class FolderSender():
 	"""Synchronizes a folder on the transmission side"""
@@ -72,10 +73,14 @@ class FolderSender():
 			return
 		self.log.info(f'Found {len(changed_files)} changed files')
 		self.log.debug(f'Changed files:  {changed_files}')
-		tar_path, included = self.tarball_files(changed_files)
+		
+		renamer_to_file = {
+			lambda p: (self.root / p, str(p)): changed_files
+		}
+		tar_path, included = tarball_files(renamer_to_file)
 		self.log.debug(f'Created new tarball: {tar_path}')
 		chunker = self.get_chunker(tar_path)
-		self.transmit_chunks(chunker)
+		transmit_chunks(chunker, self.sock, self.send_to, self.max_bytes_per_sec, self.transmit_repeats, self.log)
 		self.log.info(f'Transmitted tarball: {tar_path} (hash: {chunker.hash.hex()})')
 
 		# do cleanup
@@ -85,62 +90,61 @@ class FolderSender():
 
 	def shelf(self):
 		return shelve.open(str(self.root / '.sender_sync_data'))
-	def tarball_files(self, files: Iterable[FileMetadata]):
-		included: Set[FileMetadata] = set()
-		with tempfile.NamedTemporaryFile('wb', suffix='.tar', delete=False, dir=self.root) as f:
-			with tarfile.open(fileobj=f, mode='w', format=tarfile.GNU_FORMAT) as tarball:
-				for file in files:
-					try:
-						tarball.add(self.root / file.path, arcname=str(file.path))
-						included.add(file)
-					except OSError:
-						pass
-			f.close()
-			return Path(f.name), included
 	def get_chunker(self, file: Path):
 		return FileChunker(file, chunk_size=self.chunk_size)
-	def transmit_chunks(self, chunker: FileChunker):
-		total_bytes = 0
-		start_time = time.monotonic()
-		for copy in range(0, self.transmit_repeats):
-			self.log.info(f'Sending copy {copy+1}/{self.transmit_repeats}')
-			with chunker.chunk_iterator() as chunks:
-				for chunk_idx, chunk in enumerate(chunks):
-					total_bytes += len(chunk)
-					self.sock.sendto(chunk, self.send_to)
-					if self.max_bytes_per_sec != 0:
-						time.sleep(len(chunk) / self.max_bytes_per_sec)
-					self.log.debug(f'Sent copy {copy+1}/{self.transmit_repeats} of chunk {chunk_idx}')
-			total_time = time.monotonic() - start_time
-			self.log.info(f'Sent {si_format(total_bytes, precision=0)}bytes in {total_time}s ({si_format(total_bytes / (total_time+0.0001))}bytes/s)')
 	def handle_sent(self, tarball: Path):
 		self.log.debug(f'Deleting: {tarball}')
 		os.unlink(tarball)
 
-def get_all_file_metadata(root: Path, find_diodeinclude=True, ignore_hidden=True):
-	"""Constructs a set of all the FileMetadata in a path
+ResolveAbsoluteAndAliasFunc = Callable[[Path], Tuple[Union[str, Path], str]]
+def tarball_files(resolver_to_file: Dict[ResolveAbsoluteAndAliasFunc, Iterable[FileMetadata]],
+			tar_dir: Path=None):
+	included: Set[FileMetadata] = set()
+	with tempfile.NamedTemporaryFile('wb', suffix='.tar', delete=False, dir=tar_dir) as f:
+		with tarfile.open(fileobj=f, mode='w', format=tarfile.GNU_FORMAT) as tarball:
+			for resolver, files in resolver_to_file.items():
+				for file in files:
+					try:
+						absolute_path, alias_name = resolver(file.path)
+						tarball.add(absolute_path, arcname=alias_name)
+						included.add(file)
+					except OSError:
+						pass
+		f.close()
+		return Path(f.name), included
 
-	Args:
-		root (Path): The folder to generate a FileMetdata set for
-		find_diodeinclude (bool, optional): Checks for the existence of a .diodeinclude.
-			A .diodeinclude is basically a gitignore file, except that it specifies which files to sync.
-			Defaults to True.
-		ignore_hidden (bool, optional): Ignore files starting with '.' . Defaults to True.
+def transmit_chunks(chunker: FileChunker, sock: socket.socket, send_to: Tuple[str, int], max_bytes_per_sec=0, num_repeats=2, log=default_sender_log):
+	total_bytes = 0
+	start_time = time.monotonic()
+	for copy in range(0, num_repeats):
+		log.info(f'Sending copy {copy+1}/{num_repeats}')
+		with chunker.chunk_iterator() as chunks:
+			for chunk_idx, chunk in enumerate(chunks):
+				total_bytes += len(chunk)
+				sock.sendto(chunk, send_to)
+				if max_bytes_per_sec != 0:
+					time.sleep(len(chunk) / max_bytes_per_sec)
+				log.debug(f'Sent copy {copy+1}/{num_repeats} of chunk {chunk_idx}')
+		total_time = time.monotonic() - start_time
+		log.info(f'Sent {si_format(total_bytes, precision=0)}bytes in {total_time}s ({si_format(total_bytes / (total_time+0.0001))}bytes/s)')
 
-	Returns:
-		Set[FileMetadata]: The set of all filemetadata in the directory
-	"""
-	all_entries = root.iterdir()
-	all_files = filter(lambda p: p.is_file(), all_entries)
-	if ignore_hidden:
-		all_files = filter(lambda p: not p.stem.startswith('.'), all_entries)
+def get_all_file_metadata(root: Path, rel_to_root=True, find_diodeinclude=True, ignore_hidden=True, follow_links=True):
+	def file_to_metadata(file_path_str: str):
+		file_path = Path(file_path_str)
+		stat = file_path.stat()
+		return FileMetadata(Path(file_path).relative_to(root) if rel_to_root else file_path.resolve(), stat.st_size, stat.st_mtime)
+	
+	metadata: Set[FileMetadata] = set()
+	matcher = None
 	if find_diodeinclude:
 		diodeignore_path = root / '.diodeinclude'
 		if diodeignore_path.exists():
 			matcher = parse_gitignore(diodeignore_path, root)
-			all_files = filter(matcher, all_entries)
-	def file_to_metadata(file: Path):
-		stat = file.stat()
-		return FileMetadata(file.relative_to(root), stat.st_size, stat.st_mtime)
-	all_metadata = map(file_to_metadata, all_files)
-	return set(all_metadata)
+	for dir_name, _, files in os.walk(root, followlinks=follow_links):
+		if ignore_hidden:
+			files = filter(lambda p: not p.startswith('.'), files)
+		if matcher is not None:
+			files = filter(lambda p: matcher(os.path.join(dir_name, p)), files)
+		files_metadata = map(lambda p: file_to_metadata(os.path.join(dir_name, p)), files)
+		metadata.update(files_metadata)
+	return metadata
